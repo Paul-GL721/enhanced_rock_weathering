@@ -15,6 +15,11 @@ PROJECTED_CRS = "EPSG:32636"
 WEB_CRS = "EPSG:4326"
 
 
+def union_geometries(geometries: gpd.GeoSeries):
+    """Return one geometry with shared district borders removed."""
+    return geometries.union_all()
+
+
 def load_uganda_districts(path: Path = UGANDA_DISTRICTS) -> gpd.GeoDataFrame:
     """Load Uganda admin-2 district boundaries."""
     if not path.exists():
@@ -79,10 +84,16 @@ def make_district_aoi(
 
     selected.to_file(districts_path, layer="districts", driver="GPKG")
 
-    aoi = selected.dissolve()
-    aoi[DISTRICT_NAME_FIELD] = ", ".join(selected[DISTRICT_NAME_FIELD].tolist())
-    aoi["district_count"] = len(selected)
-    aoi["area_km2_calc"] = aoi.geometry.area / 1_000_000
+    aoi_geometry = union_geometries(selected.geometry)
+    aoi = gpd.GeoDataFrame(
+        {
+            DISTRICT_NAME_FIELD: [", ".join(selected[DISTRICT_NAME_FIELD].tolist())],
+            "district_count": [len(selected)],
+            "area_km2_calc": [aoi_geometry.area / 1_000_000],
+        },
+        geometry=[aoi_geometry],
+        crs=selected.crs,
+    )
     aoi.to_file(aoi_path, layer="aoi", driver="GPKG")
     aoi.to_crs(WEB_CRS).to_file(aoi_geojson_path, driver="GeoJSON")
 
