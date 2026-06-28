@@ -12,6 +12,7 @@ UGANDA_DISTRICTS = UGANDA_ADMIN_DIR / "uga_admin2.shp"
 DISTRICT_NAME_FIELD = "adm2_name"
 DISTRICT_CODE_FIELD = "adm2_pcode"
 PROJECTED_CRS = "EPSG:32636"
+WEB_CRS = "EPSG:4326"
 
 
 def load_uganda_districts(path: Path = UGANDA_DISTRICTS) -> gpd.GeoDataFrame:
@@ -74,6 +75,7 @@ def make_district_aoi(
 
     districts_path = output_dir / "selected_districts.gpkg"
     aoi_path = output_dir / "selected_districts_aoi.gpkg"
+    aoi_geojson_path = output_dir / "selected_districts_aoi.geojson"
 
     selected.to_file(districts_path, layer="districts", driver="GPKG")
 
@@ -82,8 +84,10 @@ def make_district_aoi(
     aoi["district_count"] = len(selected)
     aoi["area_km2_calc"] = aoi.geometry.area / 1_000_000
     aoi.to_file(aoi_path, layer="aoi", driver="GPKG")
+    aoi.to_crs(WEB_CRS).to_file(aoi_geojson_path, driver="GeoJSON")
 
     return {
         "districts": districts_path,
         "aoi": aoi_path,
+        "aoi_geojson": aoi_geojson_path,
     }
