@@ -1,0 +1,15 @@
+data/*
+!data/.gitkeep
+
+# Legacy data locations kept ignored if they reappear.
+/data_raw/
+/data_processed/
+/outputs/
+/scepter_runs/
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.DS_Store
+.DS_Store?
