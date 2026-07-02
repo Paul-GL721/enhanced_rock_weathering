@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
-import urllib.request
-from urllib.parse import quote
-from dataclasses import dataclass
+import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
+import planetary_computer
 import rasterio
+from rasterio.errors import RasterioIOError
+from pystac_client import Client
+from rasterio.features import geometry_mask
 from rasterio.mask import mask
 from rasterio.merge import merge
 from rasterio.vrt import WarpedVRT
@@ -18,366 +22,571 @@ from rasterio.warp import Resampling, reproject
 from erw_mrv.paths import BOUNDARIES_PROCESSED, LANDSAT_PROCESSED, LANDSAT_RAW, ensure_dir
 
 
-STAC_SEARCH_URL = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
-PC_SIGN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
-LANDSAT_COLLECTION = "landsat-c2-l2"
 DEFAULT_AOI = BOUNDARIES_PROCESSED / "selected_districts_aoi.geojson"
-DEFAULT_PATH_ROWS = (("172", "059"), ("172", "060"), ("173", "059"))
+DEFAULT_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+LANDSAT_COLLECTION = "landsat-c2-l2"
 DEFAULT_BANDS = ("blue", "green", "red", "nir08", "swir16", "swir22", "qa_pixel")
-DEFAULT_MOSAIC_BANDS = ("blue", "green", "red", "nir08", "swir16", "swir22")
-AWS_BUCKET = "usgs-landsat"
-_SIGNED_HREFS: dict[str, str] = {}
-CLOUD_QA_BITS = (1, 2, 3, 4)
+SPECTRAL_BANDS = ("blue", "green", "red", "nir08", "swir16", "swir22")
+DEFAULT_DATE_RANGE = "2026-01-01/2026-06-29"
+DEFAULT_MAX_CLOUD_COVER = 10
+DEFAULT_COVERAGE_TARGET_PCT = 99.9
+DEFAULT_CLIP_DIR = LANDSAT_RAW / "stac_aoi_clips" / "202601_202606"
+DEFAULT_MOSAIC_DIR = LANDSAT_PROCESSED / "mosaics" / "202601_202606"
+QA_PIXEL_CLEAR_BITS = (0, 1, 2, 3, 4)
 
 
-@dataclass(frozen=True)
-class LandsatScene:
-    item_id: str
-    path: str
-    row: str
-    datetime: str
-    cloud_cover: float
-    assets: dict
-
-    @property
-    def path_row(self) -> tuple[str, str]:
-        return self.path, self.row
-
-
-def read_aoi_bounds(aoi_path: Path = DEFAULT_AOI) -> tuple[float, float, float, float]:
+def load_aoi(aoi_path: Path = DEFAULT_AOI) -> tuple[gpd.GeoDataFrame, dict]:
+    """Load the dissolved AOI and return it with a GeoJSON geometry for STAC search."""
     aoi = gpd.read_file(aoi_path).to_crs("EPSG:4326")
-    return tuple(aoi.total_bounds)
+    aoi_geometry = aoi.geometry.union_all()
+    return aoi, aoi_geometry.__geo_interface__
 
 
-def search_landsat_scenes(
-    bbox: tuple[float, float, float, float],
-    start_date: str,
-    end_date: str,
-    max_cloud: float = 100,
-    limit: int = 100,
-) -> list[dict]:
-    payload = {
-        "collections": [LANDSAT_COLLECTION],
-        "bbox": list(bbox),
-        "datetime": f"{start_date}/{end_date}",
-        "limit": limit,
-        "query": {"eo:cloud_cover": {"lt": max_cloud}},
-    }
-    request = urllib.request.Request(
-        STAC_SEARCH_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def search_landsat_items(
+    aoi_geojson: dict,
+    date_range: str = DEFAULT_DATE_RANGE,
+    max_cloud_cover: int | float = DEFAULT_MAX_CLOUD_COVER,
+    stac_url: str = DEFAULT_STAC_URL,
+    collection: str = LANDSAT_COLLECTION,
+    max_items: int | None = None,
+) -> list:
+    """Search Planetary Computer STAC for Landsat scenes intersecting the AOI."""
+    catalog = Client.open(stac_url)
+    search = catalog.search(
+        collections=[collection],
+        intersects=aoi_geojson,
+        datetime=date_range,
+        query={"eo:cloud_cover": {"lt": max_cloud_cover}},
+        max_items=max_items,
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    return data.get("features", [])
+    return list(search.items())
 
 
-def feature_to_scene(feature: dict) -> LandsatScene:
-    props = feature["properties"]
-    return LandsatScene(
-        item_id=feature["id"],
-        path=str(props["landsat:wrs_path"]).zfill(3),
-        row=str(props["landsat:wrs_row"]).zfill(3),
-        datetime=props["datetime"],
-        cloud_cover=float(props.get("eo:cloud_cover", 100)),
-        assets=feature["assets"],
-    )
-
-
-def select_best_scenes(
-    features: Iterable[dict],
-    path_rows: Iterable[tuple[str, str]] = DEFAULT_PATH_ROWS,
-) -> list[LandsatScene]:
-    wanted = {(str(path).zfill(3), str(row).zfill(3)) for path, row in path_rows}
-    best: dict[tuple[str, str], LandsatScene] = {}
-
-    for feature in features:
-        scene = feature_to_scene(feature)
-        if scene.path_row not in wanted:
-            continue
-        if scene.path_row not in best or scene.cloud_cover < best[scene.path_row].cloud_cover:
-            best[scene.path_row] = scene
-
-    missing = sorted(wanted.difference(best))
-    if missing:
-        missing_text = ", ".join(f"{path}/{row}" for path, row in missing)
-        raise ValueError(f"No Landsat scenes found for path/row: {missing_text}")
-
-    return [best[pair] for pair in sorted(best)]
-
-
-def aws_asset_href(asset_href: str) -> str:
-    marker = "/landsat-c2/"
-    if marker not in asset_href:
-        raise ValueError(f"Cannot convert non-Landsat C2 asset href to AWS: {asset_href}")
-    suffix = asset_href.split(marker, 1)[1]
-    return f"s3://{AWS_BUCKET}/collection02/{suffix}"
-
-
-def signed_planetary_computer_href(asset_href: str) -> str:
-    """Sign a Planetary Computer asset URL for direct Rasterio access."""
-    if asset_href in _SIGNED_HREFS:
-        return _SIGNED_HREFS[asset_href]
-
-    sign_url = f"{PC_SIGN_URL}?href={quote(asset_href, safe='')}"
-    with urllib.request.urlopen(sign_url, timeout=60) as response:
-        data = json.loads(response.read().decode("utf-8"))
-
-    signed_href = data["href"]
-    _SIGNED_HREFS[asset_href] = signed_href
-    return signed_href
-
-
-def scene_manifest(scenes: Iterable[LandsatScene], bands: Iterable[str]) -> list[dict]:
-    manifest = []
-    for scene in scenes:
-        band_assets = {}
-        for band in bands:
-            if band not in scene.assets:
-                continue
-            href = scene.assets[band]["href"]
-            band_assets[band] = {
-                "href": href,
-                "aws_href": aws_asset_href(href),
-            }
-
-        manifest.append(
+def scenes_dataframe(items: Iterable) -> pd.DataFrame:
+    """Convert STAC items to a compact scene table."""
+    rows = []
+    for item in items:
+        props = item.properties
+        rows.append(
             {
-                "item_id": scene.item_id,
-                "path": scene.path,
-                "row": scene.row,
-                "datetime": scene.datetime,
-                "cloud_cover": scene.cloud_cover,
-                "bands": band_assets,
+                "item_id": item.id,
+                "datetime": props.get("datetime"),
+                "platform": props.get("platform"),
+                "cloud_cover": props.get("eo:cloud_cover"),
+                "path": props.get("landsat:wrs_path"),
+                "row": props.get("landsat:wrs_row"),
+                "asset_count": len(item.assets),
             }
         )
-    return manifest
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "item_id",
+                "datetime",
+                "platform",
+                "cloud_cover",
+                "path",
+                "row",
+                "asset_count",
+            ]
+        )
+
+    return pd.DataFrame(rows).sort_values(["datetime", "cloud_cover"]).reset_index(drop=True)
 
 
-def clip_scene_bands(
-    scene: LandsatScene,
-    aoi_path: Path,
+def select_all_scene_ids(scenes: pd.DataFrame) -> list[str]:
+    """Select every scene returned by the filtered STAC search."""
+    if scenes.empty:
+        return []
+    return scenes.sort_values(["datetime", "cloud_cover"])["item_id"].tolist()
+
+
+def items_from_ids(items: Iterable, item_ids: Iterable[str]) -> list:
+    """Return STAC items in the same order as item_ids."""
+    items_by_id = {item.id: item for item in items}
+    return [items_by_id[item_id] for item_id in item_ids]
+
+
+def clip_asset_to_aoi(
+    item,
+    band: str,
+    aoi: gpd.GeoDataFrame,
     output_dir: Path,
-    bands: Iterable[str] = DEFAULT_BANDS,
-    asset_source: str = "aws",
-) -> list[Path]:
-    output_dir = ensure_dir(output_dir / scene.item_id)
-    aoi = gpd.read_file(aoi_path)
-    written = []
+    max_retries: int = 3,
+    retry_delay: int | float = 5,
+) -> Path | None:
+    """Read a signed STAC raster asset, clip it to the AOI, and write a GeoTIFF."""
+    if band not in item.assets:
+        print(f"Skipping {item.id} {band}: asset missing")
+        return None
 
-    rasterio_env = {}
-    if asset_source == "aws":
-        rasterio_env = {
-            "AWS_REQUEST_PAYER": "requester",
-        }
+    output_dir = ensure_dir(output_dir)
+    output_path = output_dir / f"{item.id}_{band}_aoi.tif"
+    if output_path.exists():
+        print(f"Exists: {output_path.name}")
+        return output_path
 
-    with rasterio.Env(**rasterio_env):
-        for band in bands:
-            if band not in scene.assets:
-                continue
+    temp_path = output_path.with_suffix(output_path.suffix + ".part")
+    for attempt in range(1, max_retries + 1):
+        temp_path.unlink(missing_ok=True)
+        try:
+            signed_asset = planetary_computer.sign(item.assets[band])
+            with rasterio.Env(
+                GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+                GDAL_HTTP_MAX_RETRY="4",
+                GDAL_HTTP_RETRY_DELAY="2",
+                CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".TIF,.tif",
+                VSI_CACHE="TRUE",
+            ):
+                with rasterio.open(signed_asset.href) as src:
+                    shapes = aoi.to_crs(src.crs).geometry
+                    image, transform = mask(src, shapes, crop=True)
+                    profile = src.profile.copy()
 
-            href = scene.assets[band]["href"]
-            if asset_source == "aws":
-                source_href = aws_asset_href(href)
-            elif asset_source == "azure":
-                source_href = signed_planetary_computer_href(href)
-            else:
-                raise ValueError(f"Unsupported asset source: {asset_source}")
-            output_path = output_dir / f"{scene.item_id}_{band}_aoi.tif"
+            profile.update(
+                driver="GTiff",
+                height=image.shape[1],
+                width=image.shape[2],
+                transform=transform,
+                compress="deflate",
+                tiled=True,
+                BIGTIFF="IF_SAFER",
+            )
 
-            with rasterio.open(source_href) as src:
-                shapes = aoi.to_crs(src.crs).geometry
-                image, transform = mask(src, shapes, crop=True)
-                profile = src.profile.copy()
-                profile.update(
-                    {
-                        "driver": "GTiff",
-                        "height": image.shape[1],
-                        "width": image.shape[2],
-                        "transform": transform,
-                        "compress": "deflate",
-                        "tiled": True,
-                    }
-                )
-
-            with rasterio.open(output_path, "w", **profile) as dst:
+            with rasterio.open(temp_path, "w", **profile) as dst:
                 dst.write(image)
 
-            written.append(output_path)
+            temp_path.replace(output_path)
+            print(f"Wrote: {output_path.name}")
+            return output_path
+        except (RasterioIOError, OSError, RuntimeError) as exc:
+            temp_path.unlink(missing_ok=True)
+            print(
+                f"Attempt {attempt}/{max_retries} failed for {item.id} {band}: {exc}"
+            )
+            if attempt < max_retries:
+                time.sleep(retry_delay)
 
+    print(f"Failed after {max_retries} attempts: {item.id} {band}")
+    return None
+
+
+def download_scene_bands(
+    items: Iterable,
+    bands: Iterable[str],
+    aoi: gpd.GeoDataFrame,
+    output_dir: Path = DEFAULT_CLIP_DIR,
+    max_retries: int = 3,
+    retry_delay: int | float = 5,
+    show_progress: bool = True,
+) -> list[Path]:
+    """Download AOI clips for all selected scene/band combinations."""
+    items = list(items)
+    bands = list(bands)
+    total = len(items) * len(bands)
+    written = []
+    completed = 0
+    existing = 0
+    failed = 0
+
+    progress = None
+    if show_progress:
+        try:
+            from tqdm import tqdm
+
+            progress = tqdm(total=total, desc="Landsat band clips", unit="clip")
+        except ImportError:
+            progress = None
+            print(f"Downloading {total} Landsat band clips")
+
+    for item_index, item in enumerate(items, start=1):
+        for band_index, band in enumerate(bands, start=1):
+            output_path = Path(output_dir) / f"{item.id}_{band}_aoi.tif"
+            existed_before = output_path.exists()
+            path = clip_asset_to_aoi(
+                item,
+                band,
+                aoi,
+                output_dir,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+            if path is not None:
+                written.append(path)
+                if existed_before:
+                    existing += 1
+                else:
+                    completed += 1
+            else:
+                failed += 1
+
+            done = (item_index - 1) * len(bands) + band_index
+            remaining = total - done
+            if progress is not None:
+                progress.set_postfix(
+                    new=completed,
+                    existing=existing,
+                    failed=failed,
+                    left=remaining,
+                    refresh=False,
+                )
+                progress.update(1)
+            elif show_progress:
+                print(
+                    f"Progress {done}/{total}; left={remaining}; "
+                    f"new={completed}; existing={existing}; failed={failed}"
+                )
+
+    if progress is not None:
+        progress.close()
+
+    if show_progress:
+        print(
+            f"Download summary: total={total}, new={completed}, "
+            f"existing={existing}, failed={failed}"
+        )
     return written
 
 
-def download_april_2026_aoi(
-    aoi_path: Path = DEFAULT_AOI,
-    output_dir: Path = LANDSAT_RAW / "aoi_clips" / "2026-04",
-    bands: Iterable[str] = DEFAULT_BANDS,
-    path_rows: Iterable[tuple[str, str]] = DEFAULT_PATH_ROWS,
-    asset_source: str = "aws",
-    dry_run: bool = False,
-) -> tuple[list[LandsatScene], list[Path]]:
-    bbox = read_aoi_bounds(aoi_path)
-    features = search_landsat_scenes(
-        bbox=bbox,
-        start_date="2026-04-01",
-        end_date="2026-04-30",
-    )
-    scenes = select_best_scenes(features, path_rows=path_rows)
-    output_dir = ensure_dir(output_dir)
-
-    manifest_path = output_dir / "landsat_april_2026_manifest.json"
-    manifest_path.write_text(json.dumps(scene_manifest(scenes, bands), indent=2) + "\n")
-
-    if dry_run:
-        return scenes, [manifest_path]
-
-    written = [manifest_path]
-    for scene in scenes:
-        written.extend(
-            clip_scene_bands(
-                scene=scene,
-                aoi_path=aoi_path,
-                output_dir=output_dir,
-                bands=bands,
-                asset_source=asset_source,
-            )
-        )
-
-    return scenes, written
+def band_clip_paths(clip_dir: Path, band: str) -> list[Path]:
+    """Return downloaded AOI clips for one band."""
+    return sorted(Path(clip_dir).glob(f"*_{band}_aoi.tif"))
 
 
-def _scene_band_path(scene_dir: Path, band: str) -> Path | None:
-    matches = sorted(scene_dir.glob(f"*_{band}_aoi.tif"))
-    return matches[0] if matches else None
+def qa_path_for_band_clip(clip_path: Path, band: str) -> Path:
+    """Return the matching qa_pixel clip path for a downloaded band clip."""
+    clip_path = Path(clip_path)
+    suffix = f"_{band}_aoi.tif"
+    if not clip_path.name.endswith(suffix):
+        raise ValueError(f"Expected {clip_path.name} to end with {suffix}")
+    return clip_path.with_name(clip_path.name.removesuffix(suffix) + "_qa_pixel_aoi.tif")
 
 
-def _cloud_mask_from_qa(
-    qa_path: Path,
-    reference_profile: dict,
-    reference_shape: tuple[int, int],
+def clear_mask_from_qa(
+    qa_array: np.ndarray,
+    clear_bits: Iterable[int] = QA_PIXEL_CLEAR_BITS,
 ) -> np.ndarray:
+    """Return True where Landsat QA_PIXEL has no fill/cloud/shadow flags."""
+    mask_array = np.ones(qa_array.shape, dtype=bool)
+    for bit in clear_bits:
+        mask_array &= (qa_array & (1 << bit)) == 0
+    return mask_array
+
+
+def _read_qa_matching_band(band_dataset, qa_path: Path) -> np.ndarray:
+    """Read qa_pixel, reprojecting only if its grid differs from the band grid."""
     with rasterio.open(qa_path) as qa_src:
-        qa = qa_src.read(1)
         if (
-            qa_src.crs != reference_profile["crs"]
-            or qa_src.transform != reference_profile["transform"]
-            or qa.shape != reference_shape
+            qa_src.crs == band_dataset.crs
+            and qa_src.transform == band_dataset.transform
+            and qa_src.width == band_dataset.width
+            and qa_src.height == band_dataset.height
         ):
-            qa_aligned = np.zeros(reference_shape, dtype=qa.dtype)
-            reproject(
-                source=qa,
-                destination=qa_aligned,
-                src_transform=qa_src.transform,
-                src_crs=qa_src.crs,
-                dst_transform=reference_profile["transform"],
-                dst_crs=reference_profile["crs"],
-                resampling=Resampling.nearest,
-            )
-            qa = qa_aligned
+            return qa_src.read(1)
 
-    mask_bits = sum(1 << bit for bit in CLOUD_QA_BITS)
-    return (qa & mask_bits) != 0
+        qa = np.zeros((band_dataset.height, band_dataset.width), dtype=qa_src.dtypes[0])
+        reproject(
+            source=rasterio.band(qa_src, 1),
+            destination=qa,
+            src_transform=qa_src.transform,
+            src_crs=qa_src.crs,
+            dst_transform=band_dataset.transform,
+            dst_crs=band_dataset.crs,
+            resampling=Resampling.nearest,
+        )
+        return qa
 
 
-def write_cloud_masked_band(
+def write_cloud_masked_clip(
     band_path: Path,
     qa_path: Path,
     output_path: Path,
-    nodata: int = 0,
+    clear_bits: Iterable[int] = QA_PIXEL_CLEAR_BITS,
 ) -> Path:
+    """Write a temporary spectral clip with cloudy QA pixels set to nodata."""
     with rasterio.open(band_path) as src:
-        data = src.read(1)
+        data = src.read()
+        qa = _read_qa_matching_band(src, qa_path)
+        clear = clear_mask_from_qa(qa, clear_bits)
         profile = src.profile.copy()
-        source_nodata = src.nodata
 
-    cloud_mask = _cloud_mask_from_qa(qa_path, profile, data.shape)
-    invalid = cloud_mask
-    if source_nodata is not None:
-        invalid = invalid | (data == source_nodata)
+    nodata = profile.get("nodata")
+    if nodata is None:
+        nodata = 0
+        profile["nodata"] = nodata
 
-    data = data.copy()
-    data[invalid] = nodata
-    profile.update(nodata=nodata, compress="deflate", tiled=True)
+    data[:, ~clear] = nodata
+    profile.update(
+        compress="deflate",
+        tiled=True,
+        BIGTIFF="IF_SAFER",
+        SPARSE_OK="TRUE",
+    )
 
+    output_path = Path(output_path)
     ensure_dir(output_path.parent)
-    with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(data, 1)
+    temp_path = output_path.with_suffix(output_path.suffix + ".part")
+    temp_path.unlink(missing_ok=True)
+    with rasterio.open(temp_path, "w", **profile) as dst:
+        dst.write(data)
 
+    temp_path.replace(output_path)
     return output_path
 
 
-def mosaic_landsat_aoi_bands(
-    clips_dir: Path = LANDSAT_RAW / "aoi_clips" / "2026-04",
-    output_dir: Path = LANDSAT_PROCESSED / "mosaics" / "2026-04",
-    bands: Iterable[str] = DEFAULT_MOSAIC_BANDS,
-    apply_cloud_mask: bool = True,
-    nodata: int = 0,
-    target_crs: str = "EPSG:32636",
+def cloud_masked_band_clip_paths(
+    clip_paths: Iterable[Path],
+    band: str,
+    temp_dir: Path,
+    clear_bits: Iterable[int] = QA_PIXEL_CLEAR_BITS,
 ) -> list[Path]:
-    """Merge path/row AOI clips into one AOI mosaic per band."""
-    output_dir = ensure_dir(output_dir)
-    scene_dirs = sorted(path for path in clips_dir.iterdir() if path.is_dir())
-    if not scene_dirs:
-        raise FileNotFoundError(f"No scene clip directories found in {clips_dir}")
+    """Create QA-masked temporary clips for one spectral band."""
+    masked_paths = []
+    for clip_path in clip_paths:
+        qa_path = qa_path_for_band_clip(clip_path, band)
+        if not qa_path.exists():
+            print(f"Skipping cloud mask for {clip_path.name}: missing {qa_path.name}")
+            continue
+        masked_path = Path(temp_dir) / clip_path.name.replace("_aoi.tif", "_clear_aoi.tif")
+        masked_paths.append(write_cloud_masked_clip(clip_path, qa_path, masked_path, clear_bits))
+    return masked_paths
 
-    written = []
-    temp_dir = ensure_dir(output_dir / "_cloud_masked_inputs")
 
-    for band in bands:
-        band_inputs = []
-        for scene_dir in scene_dirs:
-            band_path = _scene_band_path(scene_dir, band)
-            if band_path is None:
+def mosaic_band_clips(
+    clip_paths: Iterable[Path],
+    aoi: gpd.GeoDataFrame,
+    output_path: Path,
+    method: str = "first",
+    resampling: Resampling = Resampling.nearest,
+) -> Path | None:
+    """Mosaic downloaded clips for one band, then clip the mosaic to the AOI.
+
+    Landsat path/row scenes over the AOI can arrive in different projected CRS
+    zones. Rasterio merge requires a common CRS, so mismatched inputs are read
+    through WarpedVRTs using the first clip as the target grid family.
+    """
+    clip_paths = [Path(path) for path in clip_paths]
+    if not clip_paths:
+        print(f"No clips found for {output_path.name}")
+        return None
+
+    output_path = Path(output_path)
+    ensure_dir(output_path.parent)
+    if output_path.exists():
+        try:
+            with rasterio.open(output_path) as src:
+                src.profile
+            print(f"Exists: {output_path.name}")
+            return output_path
+        except RasterioIOError:
+            print(f"Replacing unreadable mosaic: {output_path.name}")
+            output_path.unlink(missing_ok=True)
+
+    datasets = [rasterio.open(path) for path in clip_paths]
+    vrts = []
+    try:
+        target_crs = datasets[0].crs
+        merge_sources = []
+        for dataset in datasets:
+            if dataset.crs == target_crs:
+                merge_sources.append(dataset)
                 continue
 
-            if apply_cloud_mask:
-                qa_path = _scene_band_path(scene_dir, "qa_pixel")
-                if qa_path is None:
-                    raise FileNotFoundError(f"Missing qa_pixel clip in {scene_dir}")
-                masked_path = temp_dir / f"{scene_dir.name}_{band}_cloudmasked.tif"
-                band_inputs.append(write_cloud_masked_band(band_path, qa_path, masked_path, nodata=nodata))
-            else:
-                band_inputs.append(band_path)
-
-        if not band_inputs:
-            continue
-
-        datasets = [rasterio.open(path) for path in band_inputs]
-        vrt_datasets = []
-        try:
-            vrt_datasets = [
-                WarpedVRT(
-                    dataset,
-                    crs=target_crs,
-                    nodata=nodata,
-                    resampling=Resampling.nearest,
-                )
-                for dataset in datasets
-            ]
-            mosaic, transform = merge(vrt_datasets, nodata=nodata, method="first")
-            profile = vrt_datasets[0].profile.copy()
-            profile.update(
-                {
-                    "driver": "GTiff",
-                    "height": mosaic.shape[1],
-                    "width": mosaic.shape[2],
-                    "transform": transform,
-                    "nodata": nodata,
-                    "compress": "deflate",
-                    "tiled": True,
-                }
+            vrt = WarpedVRT(
+                dataset,
+                crs=target_crs,
+                resampling=resampling,
+                src_nodata=dataset.nodata,
+                nodata=dataset.nodata,
             )
-        finally:
-            for vrt_dataset in vrt_datasets:
-                vrt_dataset.close()
-            for dataset in datasets:
-                dataset.close()
+            vrts.append(vrt)
+            merge_sources.append(vrt)
 
-        output_path = output_dir / f"landsat_april_2026_aoi_{band}_mosaic.tif"
-        with rasterio.open(output_path, "w", **profile) as dst:
+        mosaic, transform = merge(merge_sources, method=method)
+        profile = merge_sources[0].profile.copy()
+        profile.update(
+            driver="GTiff",
+            height=mosaic.shape[1],
+            width=mosaic.shape[2],
+            transform=transform,
+            crs=target_crs,
+            compress="deflate",
+            tiled=True,
+            BIGTIFF="IF_SAFER",
+            SPARSE_OK="TRUE",
+        )
+
+        temp_path = output_path.with_suffix(output_path.suffix + ".part")
+        temp_path.unlink(missing_ok=True)
+        with rasterio.open(temp_path, "w", **profile) as dst:
             dst.write(mosaic)
-        written.append(output_path)
 
-    return written
+        with rasterio.open(temp_path) as src:
+            shapes = aoi.to_crs(src.crs).geometry
+            clipped, clipped_transform = mask(src, shapes, crop=True)
+            clipped_profile = src.profile.copy()
+
+        clipped_profile.update(
+            height=clipped.shape[1],
+            width=clipped.shape[2],
+            transform=clipped_transform,
+            compress="deflate",
+            tiled=True,
+            BIGTIFF="IF_SAFER",
+            SPARSE_OK="TRUE",
+        )
+        final_temp_path = output_path.with_suffix(output_path.suffix + ".final.part")
+        final_temp_path.unlink(missing_ok=True)
+        with rasterio.open(final_temp_path, "w", **clipped_profile) as dst:
+            dst.write(clipped)
+
+        temp_path.unlink(missing_ok=True)
+        final_temp_path.replace(output_path)
+    finally:
+        for vrt in vrts:
+            vrt.close()
+        for dataset in datasets:
+            dataset.close()
+
+    print(f"Wrote mosaic: {output_path.name}")
+    return output_path
+
+
+def mosaic_downloaded_bands(
+    clip_dir: Path,
+    aoi: gpd.GeoDataFrame,
+    bands: Iterable[str] = DEFAULT_BANDS,
+    output_dir: Path = DEFAULT_MOSAIC_DIR,
+    method: str = "first",
+    apply_cloud_mask: bool = True,
+    clear_bits: Iterable[int] = QA_PIXEL_CLEAR_BITS,
+) -> list[Path]:
+    """Create one AOI-clipped mosaic per band from downloaded scene clips."""
+    output_dir = ensure_dir(output_dir)
+    mosaics = []
+    temp_parent = ensure_dir(output_dir / "_tmp_cloud_masked")
+    with tempfile.TemporaryDirectory(dir=temp_parent) as temp_dir:
+        for band in bands:
+            paths = band_clip_paths(clip_dir, band)
+            if apply_cloud_mask and band != "qa_pixel":
+                paths = cloud_masked_band_clip_paths(paths, band, Path(temp_dir), clear_bits)
+            output_path = output_dir / f"landsat_{band}_mosaic_aoi.tif"
+            mosaic_path = mosaic_band_clips(paths, aoi, output_path, method=method)
+            if mosaic_path is not None:
+                mosaics.append(mosaic_path)
+    return mosaics
+
+
+def mosaic_coverage_dataframe(
+    mosaic_paths: Iterable[Path],
+    aoi: gpd.GeoDataFrame,
+) -> pd.DataFrame:
+    """Report valid-data coverage inside the AOI for each mosaic."""
+    rows = []
+    for path in mosaic_paths:
+        path = Path(path)
+        with rasterio.open(path) as src:
+            inside_aoi = geometry_mask(
+                aoi.to_crs(src.crs).geometry,
+                out_shape=(src.height, src.width),
+                transform=src.transform,
+                invert=True,
+            )
+            valid_data = src.dataset_mask() > 0
+            inside_pixels = int(inside_aoi.sum())
+            valid_inside_pixels = int((inside_aoi & valid_data).sum())
+            coverage = (
+                valid_inside_pixels / inside_pixels * 100 if inside_pixels else 0
+            )
+        rows.append(
+            {
+                "path": str(path),
+                "band": path.name.removeprefix("landsat_").removesuffix("_mosaic_aoi.tif"),
+                "inside_aoi_pixels": inside_pixels,
+                "valid_inside_aoi_pixels": valid_inside_pixels,
+                "valid_aoi_coverage_pct": coverage,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def coverage_gaps(
+    coverage: pd.DataFrame,
+    target_pct: float = DEFAULT_COVERAGE_TARGET_PCT,
+    exclude_bands: Iterable[str] = ("qa_pixel",),
+) -> pd.DataFrame:
+    """Return mosaic coverage rows that fall below the target."""
+    if coverage.empty:
+        return coverage
+    exclude_bands = set(exclude_bands)
+    checked = coverage[~coverage["band"].isin(exclude_bands)].copy()
+    return checked[checked["valid_aoi_coverage_pct"] < target_pct]
+
+
+def coverage_is_complete(
+    coverage: pd.DataFrame,
+    target_pct: float = DEFAULT_COVERAGE_TARGET_PCT,
+    exclude_bands: Iterable[str] = ("qa_pixel",),
+) -> bool:
+    """Return True when all checked bands meet the AOI coverage target."""
+    if coverage.empty:
+        return False
+    return coverage_gaps(coverage, target_pct, exclude_bands).empty
+
+
+def require_coverage(
+    coverage: pd.DataFrame,
+    target_pct: float = DEFAULT_COVERAGE_TARGET_PCT,
+    exclude_bands: Iterable[str] = ("qa_pixel",),
+) -> None:
+    """Raise when cloud-masked mosaics do not meet the AOI coverage target."""
+    gaps = coverage_gaps(coverage, target_pct, exclude_bands)
+    if gaps.empty:
+        return
+
+    gap_text = gaps[["band", "valid_aoi_coverage_pct"]].to_string(index=False)
+    raise ValueError(
+        f"Mosaic AOI coverage is below {target_pct:.2f}% for one or more bands.\n"
+        f"{gap_text}\n"
+        "Widen DATE_RANGE, relax MAX_CLOUD_COVER, or download more scenes and rerun "
+        "the cloud-masked mosaic."
+    )
+
+
+def write_manifest(
+    manifest_path: Path,
+    *,
+    stac_url: str,
+    collection: str,
+    date_range: str,
+    max_cloud_cover: int | float,
+    aoi_path: Path,
+    bands: Iterable[str],
+    selected_item_ids: Iterable[str],
+    written: Iterable[Path],
+    mosaics: Iterable[Path] | None = None,
+    apply_cloud_mask: bool = True,
+    coverage_target_pct: float = DEFAULT_COVERAGE_TARGET_PCT,
+    coverage: pd.DataFrame | None = None,
+) -> Path:
+    """Write a JSON manifest for downloaded clips and mosaics."""
+    manifest = {
+        "stac_url": stac_url,
+        "collection": collection,
+        "date_range": date_range,
+        "max_cloud_cover": max_cloud_cover,
+        "aoi_path": str(aoi_path),
+        "bands": list(bands),
+        "selected_item_ids": list(selected_item_ids),
+        "written": [str(path) for path in written],
+        "mosaics": [str(path) for path in mosaics or []],
+        "apply_cloud_mask": apply_cloud_mask,
+        "qa_pixel_clear_bits": list(QA_PIXEL_CLEAR_BITS),
+        "coverage_target_pct": coverage_target_pct,
+        "coverage": coverage.to_dict(orient="records") if coverage is not None else [],
+    }
+    manifest_path = Path(manifest_path)
+    ensure_dir(manifest_path.parent)
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    return manifest_path

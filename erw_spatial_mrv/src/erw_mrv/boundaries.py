@@ -25,7 +25,7 @@ def load_uganda_districts(path: Path = UGANDA_DISTRICTS) -> gpd.GeoDataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"District shapefile not found at {path}. "
-            "Expected Uganda admin boundaries under data_raw/boundaries."
+            "Expected Uganda admin boundaries under data/raw/boundaries."
         )
 
     districts = gpd.read_file(path)
