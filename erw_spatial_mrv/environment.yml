@@ -1,0 +1,36 @@
+name: erw_spatial_mrv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - ipykernel
+  - jupyterlab
+  - notebook
+  - libblas=*=*openblas
+  - libcblas=*=*openblas
+  - liblapack=*=*openblas
+  - libopenblas
+  - numpy<2.3
+  - pandas
+  - geopandas
+  - rasterio
+  - rioxarray
+  - xarray
+  - pystac-client
+  - planetary-computer
+  - shapely
+  - pyproj
+  - fiona
+  - matplotlib
+  - seaborn
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - tqdm
+  - gdal
+  - dask
+  - distributed
+  - cloudpickle
+  - pip:
+    - ipython
