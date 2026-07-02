@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Process Uganda admin boundary shapefiles into selected district "
-            "and dissolved AOI GeoPackages."
+            "GeoPackage plus dissolved AOI GeoPackage and GeoJSON outputs."
         )
     )
     parser.add_argument(
@@ -36,6 +36,7 @@ def main() -> None:
     print("Boundary processing complete.")
     print(f"Selected districts: {outputs['districts']}")
     print(f"Dissolved AOI: {outputs['aoi']}")
+    print(f"Dissolved AOI GeoJSON: {outputs['aoi_geojson']}")
 
 
 if __name__ == "__main__":
