@@ -32,5 +32,8 @@ dependencies:
   - dask
   - distributed
   - cloudpickle
+  - make
+  - gfortran_osx-64
+  - openblas
   - pip:
     - ipython
