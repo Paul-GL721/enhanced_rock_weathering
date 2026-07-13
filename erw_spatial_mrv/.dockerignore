@@ -1,0 +1,20 @@
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.ipynb_checkpoints/
+
+# Heavy or machine-specific source data that is not needed for notebooks 05-07.
+data/raw/**
+
+# Generated outputs should be mounted from EBS/S3-backed storage instead of baked into the image.
+data/outputs/**
+data/scepter_runs/outputs/**
+data/scepter_runs/logs/**
+
+# Force Docker/Linux to compile its own SCEPTER executable.
+external/SCEPTER/scepter
+
+# Local VCS/runtime noise.
+.git/
+.pytest_cache/
