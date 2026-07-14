@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     gfortran \
+    libblas-dev \
+    liblapack-dev \
     make \
     screen \
     && rm -rf /var/lib/apt/lists/*
@@ -24,10 +26,15 @@ RUN conda install -n base -c conda-forge -y mamba \
 COPY . ${PROJECT_DIR}
 
 ARG BASALT_DEFINES=basalt_defines_BLACK.h
+RUN test -f notebooks/05_run_scepter_scenarios.ipynb \
+    && test -f notebooks/06_extract_scepter_outputs.ipynb \
+    && test -f notebooks/07_spatial_mrv_maps_reports.ipynb \
+    && test -f data/scepter_runs/inputs/scepter_runs.csv
+
 RUN test -f "external/SCEPTER/data/${BASALT_DEFINES}" \
     && cp "external/SCEPTER/data/${BASALT_DEFINES}" external/SCEPTER/basalt_defines.h \
     && gfortran -cpp -O2 -ffree-line-length-none -Iexternal/SCEPTER -Iexternal/SCEPTER/data \
-        -o external/SCEPTER/scepter external/SCEPTER/scepter.f90 \
+        -o external/SCEPTER/scepter external/SCEPTER/scepter.f90 -llapack -lblas \
     && chmod +x external/SCEPTER/scepter \
     && mkdir -p data/scepter_runs/outputs data/scepter_runs/logs data/outputs
 
