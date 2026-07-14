@@ -16,8 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR ${PROJECT_DIR}
 
 COPY environment.yml /tmp/environment.yml
-RUN grep -v "gfortran_osx-64" /tmp/environment.yml > /tmp/environment-linux.yml \
-    && conda env create -f /tmp/environment-linux.yml \
+RUN conda install -n base -c conda-forge -y mamba \
+    && grep -v "gfortran_osx-64" /tmp/environment.yml > /tmp/environment-linux.yml \
+    && mamba env create -f /tmp/environment-linux.yml \
     && conda clean -afy
 
 COPY . ${PROJECT_DIR}
