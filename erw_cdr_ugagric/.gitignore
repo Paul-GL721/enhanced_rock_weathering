@@ -1,0 +1,4 @@
+
+# Data folder is intentionally ignored because it can become large.
+/data/
+.DS_Store

@@ -10,6 +10,7 @@ data/*
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+external/
 
 .DS_Store
 .DS_Store?
