@@ -91,7 +91,7 @@ def make_model_units(
     defaults: ScepterDefaults | None = None,
     max_units: int | None = None,
 ) -> gpd.GeoDataFrame:
-    """Convert cropland parcels into SCEPTER model units with interim attributes."""
+    """Convert cropland spatial units into SCEPTER model units with interim attributes."""
     defaults = defaults or ScepterDefaults()
     units = parcels.copy()
     units = units[~units.geometry.is_empty & units.geometry.notna()].copy()
@@ -132,6 +132,17 @@ def model_units_table(units: gpd.GeoDataFrame) -> pd.DataFrame:
         "runoff_mm_yr",
         "input_status",
     ]
+    optional_columns = [
+        "soil_source",
+        "soil_source_path",
+        "soil_note",
+        "rainfall_source",
+        "rainfall_source_path",
+        "rainfall_months_used",
+        "missing_requested_months",
+        "runoff_note",
+    ]
+    columns.extend(column for column in optional_columns if column in units.columns)
     return pd.DataFrame(units[columns]).copy()
 
 
@@ -190,12 +201,12 @@ def scepter_inputs_readme() -> str:
 
 These files are the first-pass SCEPTER input staging tables for the ERW spatial MRV workflow.
 
-- `scepter_model_units.gpkg`: spatial cropland model units derived from cleaned field parcels.
-- `scepter_model_units.csv`: non-spatial model unit attributes.
+- `scepter_model_units.gpkg`: spatial cropland model units derived from ESA cropland raster blocks.
+- `scepter_model_units.csv`: non-spatial model unit attributes with cropland, soil, rainfall, and runoff provenance.
 - `scepter_scenarios.csv`: ERW application scenarios.
 - `scepter_runs.csv`: one row per model unit and scenario.
 
-Current soil and climate values are explicit assumptions. Replace them with SoilGrids, CHIRPS, terrain, and local management attributes before treating model results as decision-grade.
+Soil and rainfall inputs should come from the processed HWSD2 and CHIRPS artifacts when available. Runoff remains an explicit first-pass estimate until a runoff layer is added.
 """
 
 
@@ -232,7 +243,7 @@ def scepter_run_config(row: pd.Series | dict, output_dir: Path) -> dict:
     """Convert one run-table row into a simple model configuration dictionary."""
     record = dict(row)
     run_id = str(record["run_id"])
-    return {
+    config = {
         "run_id": run_id,
         "model_unit_id": record["model_unit_id"],
         "scenario_id": record["scenario_id"],
@@ -265,6 +276,68 @@ def scepter_run_config(row: pd.Series | dict, output_dir: Path) -> dict:
             "summary_csv": str(output_dir / f"{run_id}_summary.csv"),
         },
     }
+    cropland_keys = [
+        "cropland_source",
+        "cropland_source_path",
+        "cropland_pixels",
+        "cropland_pixel_area_m2",
+        "cropland_area_note",
+    ]
+    cropland = {
+        key: record[key]
+        for key in cropland_keys
+        if key in record and pd.notna(record[key])
+    }
+    if cropland:
+        config["cropland"] = cropland
+
+    soil_map_keys = [
+        "soil_map_hwsd2_unit_id",
+        "soil_map_texture_group",
+        "soil_map_wrb4",
+        "soil_map_fao90",
+        "soil_map_clay_pct",
+        "soil_map_sand_pct",
+        "soil_map_silt_pct",
+        "soil_map_source_path",
+        "soil_map_join",
+    ]
+    soil_map = {
+        key: record[key]
+        for key in soil_map_keys
+        if key in record and pd.notna(record[key])
+    }
+    if soil_map:
+        config["soil_map"] = soil_map
+
+    source_keys = [
+        "input_status",
+        "cropland_source",
+        "cropland_source_path",
+        "cropland_area_note",
+        "soil_map_hwsd2_unit_id",
+        "soil_map_texture_group",
+        "soil_map_wrb4",
+        "soil_map_fao90",
+        "soil_map_source_path",
+        "soil_map_join",
+        "soil_source",
+        "soil_source_path",
+        "soil_note",
+        "rainfall_source",
+        "rainfall_source_path",
+        "rainfall_months_used",
+        "missing_requested_months",
+        "runoff_note",
+    ]
+    sources = {
+        key: record[key]
+        for key in source_keys
+        if key in record and pd.notna(record[key])
+    }
+    if sources:
+        config["input_sources"] = sources
+    return config
 
 
 def write_run_configs(
@@ -284,6 +357,36 @@ def write_run_configs(
         config_path = run_dir / "scepter_config.json"
         config = scepter_run_config(row, output_dir)
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        source_fields = [
+            "input_status",
+            "cropland_source",
+            "cropland_source_path",
+            "cropland_pixels",
+            "cropland_pixel_area_m2",
+            "cropland_area_note",
+            "soil_map_hwsd2_unit_id",
+            "soil_map_texture_group",
+            "soil_map_wrb4",
+            "soil_map_fao90",
+            "soil_map_clay_pct",
+            "soil_map_sand_pct",
+            "soil_map_silt_pct",
+            "soil_map_source_path",
+            "soil_map_join",
+            "soil_source",
+            "soil_source_path",
+            "soil_note",
+            "rainfall_source",
+            "rainfall_source_path",
+            "rainfall_months_used",
+            "missing_requested_months",
+            "runoff_note",
+        ]
+        source_record = {
+            key: row[key]
+            for key in source_fields
+            if key in row and pd.notna(row[key])
+        }
         records.append(
             {
                 "run_id": run_id,
@@ -293,6 +396,7 @@ def write_run_configs(
                 "output_dir": output_dir,
                 "config_path": config_path,
                 "status": "staged",
+                **source_record,
             }
         )
 
@@ -337,6 +441,16 @@ def execute_scepter_runs(
             log_path.write_text(exc.stdout or "", encoding="utf-8")
             err_path.write_text(exc.stderr or "SCEPTER run timed out.", encoding="utf-8")
             status = "timeout"
+        except FileNotFoundError as exc:
+            err_path.write_text(
+                f"SCEPTER command was not found: {command[0]}\n"
+                "Install SCEPTER in this runtime or update SCEPTER_COMMAND_TEMPLATE "
+                "to the executable/script path that runs the model.\n"
+                f"Original error: {exc}\n",
+                encoding="utf-8",
+            )
+            log_path.write_text("", encoding="utf-8")
+            status = "command_not_found"
 
         elapsed_seconds = time.time() - started
         records.append(
@@ -397,6 +511,31 @@ def read_run_summary(path: Path) -> dict:
 def extract_scepter_results(manifest: pd.DataFrame) -> pd.DataFrame:
     """Extract available per-run SCEPTER summary outputs."""
     records = []
+    source_fields = [
+        "input_status",
+        "cropland_source",
+        "cropland_source_path",
+        "cropland_pixels",
+        "cropland_pixel_area_m2",
+        "cropland_area_note",
+        "soil_map_hwsd2_unit_id",
+        "soil_map_texture_group",
+        "soil_map_wrb4",
+        "soil_map_fao90",
+        "soil_map_clay_pct",
+        "soil_map_sand_pct",
+        "soil_map_silt_pct",
+        "soil_map_source_path",
+        "soil_map_join",
+        "soil_source",
+        "soil_source_path",
+        "soil_note",
+        "rainfall_source",
+        "rainfall_source_path",
+        "rainfall_months_used",
+        "missing_requested_months",
+        "runoff_note",
+    ]
     for row in manifest.to_dict(orient="records"):
         summary_path = expected_summary_path(row)
         base = {
@@ -406,6 +545,13 @@ def extract_scepter_results(manifest: pd.DataFrame) -> pd.DataFrame:
             "execution_status": row["status"],
             "summary_path": summary_path,
         }
+        base.update(
+            {
+                key: row[key]
+                for key in source_fields
+                if key in row and pd.notna(row[key])
+            }
+        )
 
         if summary_path.exists():
             metrics = read_run_summary(summary_path)
@@ -428,7 +574,11 @@ def join_results_to_units(
     if "model_unit_id" not in units.columns:
         raise ValueError(f"Model unit file is missing `model_unit_id`: {units_path}")
 
-    return units.merge(results, on="model_unit_id", how="right")
+    unit_columns = [
+        "model_unit_id",
+        *[column for column in units.columns if column not in results.columns and column != "model_unit_id"],
+    ]
+    return units[unit_columns].merge(results, on="model_unit_id", how="right")
 
 
 def summarize_scepter_results(results: pd.DataFrame) -> pd.DataFrame:
