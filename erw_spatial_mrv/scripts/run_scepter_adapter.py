@@ -130,15 +130,18 @@ def build_native_inputs(config: dict, output_dir: Path, scepter_root: Path, year
 
     output_dir.mkdir(parents=True, exist_ok=True)
     scepter_data = scepter_root / "data"
-    dust_file = scepter_data / "dust_basalt.in"
+    dust_file = scepter_data / "dust_gbasalt.in"
     secondaries_file = scepter_data / "2ndslds_def.in"
 
     sld_list = ["inrt", "g2"]
     srcfile_dust = None
+    dust_species = ""
     if fdust_g_m2_yr > 0:
-        # dust_basalt.in defines the basalt composition; include common oxide
-        # phase labels used by SCEPTER's basalt helper scripts.
-        sld_list.extend(["cao", "mgo", "na2o", "k2o"])
+        # Use SCEPTER's glass-basalt phase. The previous oxide/mineral mix
+        # activated oxide solids while copying a mineral dust file, which made
+        # the basalt amendment difficult to trace in the flux outputs.
+        sld_list.append("gbas")
+        dust_species = "gbas"
         srcfile_dust = str(dust_file) if dust_file.exists() else None
 
     make_inputs.get_input_frame(
@@ -191,7 +194,7 @@ def build_native_inputs(config: dict, output_dir: Path, scepter_root: Path, year
         outdir=outdir,
         runname=runname,
         sld_list=sld_list,
-        aq_list=["ca", "k", "mg", "na"],
+        aq_list=["ca", "k", "mg", "na", "si", "al", "fe2"],
         gas_list=["pco2"],
         exrxn_list=[],
     )
@@ -205,6 +208,12 @@ def build_native_inputs(config: dict, output_dir: Path, scepter_root: Path, year
 
     cec_params = ("inrt", cec, 5.9, 4.8, 10.47, 10.786, 16.47, 3.4)
     make_inputs.get_input_sld_properties(outdir=outdir, runname=runname, filename="psdpr.in", sld_varlist=[])
+    make_inputs.get_input_sld_properties(
+        outdir=outdir,
+        runname=runname,
+        filename="psdrain.in",
+        sld_varlist=[(particle_radius_m, 0.2, 1.0)] if fdust_g_m2_yr > 0 else [],
+    )
     make_inputs.get_input_sld_properties(
         outdir=outdir,
         runname=runname,
@@ -234,7 +243,12 @@ def build_native_inputs(config: dict, output_dir: Path, scepter_root: Path, year
         "q_m_yr": runoff_m_yr,
         "porosity": porosity,
         "particle_radius_m": particle_radius_m,
-        "adapter_note": "short smoke-test run" if years != config_years else "configured simulation years",
+        "active_solid_species": ",".join(sld_list),
+        "active_aqueous_species": "ca,k,mg,na,si,al,fe2",
+        "dust_source": str(dust_file) if srcfile_dust else "",
+        "dust_species": dust_species,
+        "native_input_dir": str(output_dir / "native_inputs"),
+        "adapter_note": "production-years override" if years != config_years else "configured simulation years",
     }
 
 
@@ -327,9 +341,42 @@ def write_summary(output_dir: Path, config: dict, native: dict, completed: subpr
     return summary_path
 
 
+def archive_native_inputs(output_dir: Path) -> Path:
+    """Keep a small audit copy of the generated SCEPTER input deck."""
+    input_names = [
+        "frame.in",
+        "switches.in",
+        "slds.in",
+        "solutes.in",
+        "gases.in",
+        "extrxns.in",
+        "parentrock.in",
+        "rain.in",
+        "atm.in",
+        "dust.in",
+        "psdrain.in",
+        "psdpr.in",
+        "cec.in",
+        "OM_rain.in",
+        "kinspc.in",
+        "keqspc.in",
+        "sa.in",
+        "nopsd.in",
+        "2ndslds.in",
+    ]
+    archive_dir = output_dir / "native_inputs"
+    archive_dir.mkdir(exist_ok=True)
+    for name in input_names:
+        src = output_dir / name
+        if src.exists():
+            shutil.copy2(src, archive_dir / name)
+    return archive_dir
+
+
 def remove_native_outputs(output_dir: Path) -> None:
     """Drop bulky SCEPTER-native outputs after summary metrics are extracted."""
     keep_names = {
+        "native_inputs",
         "scepter_stdout.log",
         "scepter_stderr.log",
         f"{output_dir.name}_summary.csv",
@@ -368,12 +415,14 @@ def main() -> int:
             stderr=(as_text(exc.stderr) + "\nSCEPTER adapter timed out.").strip(),
         )
         summary_path = write_summary(args.output_dir, config, native, completed, time.time() - started)
+        archive_native_inputs(args.output_dir)
         if not args.keep_native_outputs:
             remove_native_outputs(args.output_dir)
         print(f"Wrote SCEPTER adapter timeout summary: {summary_path}")
         return 124
 
     summary_path = write_summary(args.output_dir, config, native, completed, time.time() - started)
+    archive_native_inputs(args.output_dir)
     if not args.keep_native_outputs:
         remove_native_outputs(args.output_dir)
     print(f"Wrote SCEPTER adapter summary: {summary_path}")
