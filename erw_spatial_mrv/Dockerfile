@@ -33,7 +33,7 @@ RUN test -f notebooks/05_run_scepter_scenarios.ipynb \
 
 RUN test -f "external/SCEPTER/data/${BASALT_DEFINES}" \
     && cp "external/SCEPTER/data/${BASALT_DEFINES}" external/SCEPTER/basalt_defines.h \
-    && gfortran -cpp -O2 -ffree-line-length-none -Iexternal/SCEPTER -Iexternal/SCEPTER/data \
+    && gfortran -cpp -Dmod_basalt_cmp -O2 -ffree-line-length-none -Iexternal/SCEPTER -Iexternal/SCEPTER/data \
         -o external/SCEPTER/scepter external/SCEPTER/scepter.f90 -llapack -lblas \
     && chmod +x external/SCEPTER/scepter \
     && mkdir -p data/scepter_runs/outputs data/scepter_runs/logs data/outputs
