@@ -379,10 +379,9 @@ def remove_native_outputs(output_dir: Path) -> None:
         "native_inputs",
         "scepter_stdout.log",
         "scepter_stderr.log",
-        f"{output_dir.name}_summary.csv",
     }
     for child in output_dir.iterdir():
-        if child.name in keep_names:
+        if child.name in keep_names or child.name.endswith("_summary.csv"):
             continue
         if child.is_dir():
             shutil.rmtree(child)
