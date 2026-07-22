@@ -213,9 +213,9 @@ Notebook `06_extract_scepter_outputs.ipynb` can only compute CO2 removal or carb
 
 ## Running SCEPTER In Docker
 
-Use Docker for long production runs, especially the 10-year full AOI run. The Docker image builds a Linux Conda environment, compiles SCEPTER inside the image, and runs notebooks `05`, `06`, and `07`.
+Use Docker for long production runs on EC2. The image builds a Linux Conda environment, compiles SCEPTER inside the image, and can run the full sequence from model-unit preparation through notebooks `05`, `06`, and `07`.
 
-The Docker build expects the required notebooks, source code, processed inputs, and staged SCEPTER run configs to be present in the build context. It does not need raw ESA/HWSD2 downloads for notebooks `05` to `07`.
+The Docker build expects the required notebooks, source code, processed inputs, and staged SCEPTER run configs to be present in the build context. It does not need raw ESA/HWSD2/HWSD downloads once the processed cropland, rainfall, and soil inputs have already been created.
 
 ### Sync Required Files To EC2
 
@@ -270,7 +270,7 @@ On EC2:
 
 ```bash
 cd /scepter/erw_spatial_mrv
-docker build -t paulgl721/erw:scepter-10yr .
+docker build -t paulgl721/erw:scepter-production .
 ```
 
 The Dockerfile removes the macOS-only `gfortran_osx-64` dependency from `environment.yml`, uses `mamba` for faster environment solving, installs Linux BLAS/LAPACK packages, and compiles `external/SCEPTER/scepter` with:
@@ -283,10 +283,57 @@ If you want to publish the image to Docker Hub:
 
 ```bash
 docker login -u paulgl721
-docker push paulgl721/erw:scepter-10yr
+docker push paulgl721/erw:scepter-production
 ```
 
-### Run The 10-Year Batch
+### Build Model Units
+
+Before running SCEPTER, rebuild the model-unit inputs from notebook `04`. This step uses the ESA cropland mask, rainfall rasters, and soil map to create:
+
+```text
+data/scepter_runs/inputs/scepter_model_units.csv
+data/scepter_runs/inputs/scepter_scenarios.csv
+data/scepter_runs/inputs/scepter_runs.csv
+```
+
+Create the mounted input/output folders:
+
+```bash
+mkdir -p \
+  /scepter/erw_spatial_mrv/data/processed \
+  /scepter/erw_spatial_mrv/data/scepter_runs/inputs \
+  /scepter/erw_spatial_mrv/data/scepter_runs/outputs \
+  /scepter/erw_spatial_mrv/data/scepter_runs/logs \
+  /scepter/erw_spatial_mrv/data/outputs
+```
+
+Run notebook `04` inside the container. By default `ERW_MAX_MODEL_UNITS=all` builds every available cropland model unit. Set it to a number such as `100` or `500` only when you want a smaller test run.
+
+```bash
+docker run --rm \
+  --name erw-prepare-scepter-inputs \
+  -e ERW_MAX_MODEL_UNITS=all \
+  -v /scepter/erw_spatial_mrv/data/processed:/workspace/erw_spatial_mrv/data/processed \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/inputs:/workspace/erw_spatial_mrv/data/scepter_runs/inputs \
+  paulgl721/erw:scepter-production \
+  /opt/conda/envs/erw_spatial_mrv/bin/jupyter nbconvert \
+    --to notebook \
+    --execute \
+    --inplace \
+    notebooks/04_test_scepter_inputs.ipynb \
+    --ExecutePreprocessor.timeout=7200
+```
+
+Check the run count before launching the batch:
+
+```bash
+wc -l /scepter/erw_spatial_mrv/data/scepter_runs/inputs/scepter_model_units.csv
+wc -l /scepter/erw_spatial_mrv/data/scepter_runs/inputs/scepter_runs.csv
+```
+
+The expected number of completed summary files is the number of rows in `scepter_runs.csv` minus the header row.
+
+### Run A Year-Specific SCEPTER Batch
 
 Create persistent output folders on the mounted volume:
 
@@ -297,38 +344,73 @@ mkdir -p \
   /scepter/erw_spatial_mrv/data/outputs
 ```
 
-Run the container detached:
+Each production run should use a year-specific label. The runner writes SCEPTER summaries to `data/scepter_runs/outputs/<label>/`, spatial outputs to `data/outputs/<label>/`, and executed notebooks to `data/outputs/<label>/executed_notebooks/`.
+
+For a 1-year run:
 
 ```bash
+docker rm -f erw-scepter-1yr 2>/dev/null || true
+
 docker run -d \
-  --name erw-scepter-10yr \
+  --name erw-scepter-1yr \
+  -e ERW_SCEPTER_PRODUCTION_YEARS=1 \
+  -e ERW_SCEPTER_RUN_LABEL=yr_1 \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/inputs:/workspace/erw_spatial_mrv/data/scepter_runs/inputs \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/runs:/workspace/erw_spatial_mrv/data/scepter_runs/runs \
   -v /scepter/erw_spatial_mrv/data/scepter_runs/outputs:/workspace/erw_spatial_mrv/data/scepter_runs/outputs \
   -v /scepter/erw_spatial_mrv/data/scepter_runs/logs:/workspace/erw_spatial_mrv/data/scepter_runs/logs \
   -v /scepter/erw_spatial_mrv/data/outputs:/workspace/erw_spatial_mrv/data/outputs \
-  paulgl721/erw:scepter-10yr
+  paulgl721/erw:scepter-production
 ```
+
+For a 10-year run:
+
+```bash
+docker rm -f erw-scepter-10yr 2>/dev/null || true
+
+docker run -d \
+  --name erw-scepter-10yr \
+  -e ERW_SCEPTER_PRODUCTION_YEARS=10 \
+  -e ERW_SCEPTER_RUN_LABEL=yr_10 \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/inputs:/workspace/erw_spatial_mrv/data/scepter_runs/inputs \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/runs:/workspace/erw_spatial_mrv/data/scepter_runs/runs \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/outputs:/workspace/erw_spatial_mrv/data/scepter_runs/outputs \
+  -v /scepter/erw_spatial_mrv/data/scepter_runs/logs:/workspace/erw_spatial_mrv/data/scepter_runs/logs \
+  -v /scepter/erw_spatial_mrv/data/outputs:/workspace/erw_spatial_mrv/data/outputs \
+  paulgl721/erw:scepter-production
+```
+
+To run another horizon, change only the container name, `ERW_SCEPTER_PRODUCTION_YEARS`, and `ERW_SCEPTER_RUN_LABEL`. For example, a 5-year run uses `erw-scepter-5yr`, `ERW_SCEPTER_PRODUCTION_YEARS=5`, and `ERW_SCEPTER_RUN_LABEL=yr_5`.
 
 The default container environment is:
 
 ```text
 ERW_SCEPTER_RUN_MODE=final
 ERW_RUN_EXTERNAL_SCEPTER=true
-ERW_SCEPTER_PRODUCTION_YEARS=10
+ERW_SCEPTER_PRODUCTION_YEARS=5
+ERW_SCEPTER_RUN_LABEL=yr_5
 ERW_SCEPTER_TIMEOUT_SECONDS=21600
 RUN_DOWNSTREAM_NOTEBOOKS=true
 ```
 
-Override any value with `-e`, for example:
+After the run finishes, pull year-specific outputs and executed notebooks back to the local project from your Mac:
 
 ```bash
-docker run -d \
-  --name erw-scepter-10yr \
-  -e ERW_SCEPTER_PRODUCTION_YEARS=10 \
-  -e RUN_DOWNSTREAM_NOTEBOOKS=true \
-  -v /scepter/erw_spatial_mrv/data/scepter_runs/outputs:/workspace/erw_spatial_mrv/data/scepter_runs/outputs \
-  -v /scepter/erw_spatial_mrv/data/scepter_runs/logs:/workspace/erw_spatial_mrv/data/scepter_runs/logs \
-  -v /scepter/erw_spatial_mrv/data/outputs:/workspace/erw_spatial_mrv/data/outputs \
-  paulgl721/erw:scepter-10yr
+rsync -avz --progress \
+  -e "ssh -i ~/.ssh/gls_ash_system.pem" \
+  ubuntu@ec2-54-228-60-184.eu-west-1.compute.amazonaws.com:/scepter/erw_spatial_mrv/data/scepter_runs/outputs/yr_1/ \
+  erw_spatial_mrv/data/scepter_runs/outputs/yr_1/
+
+rsync -avz --progress \
+  -e "ssh -i ~/.ssh/gls_ash_system.pem" \
+  ubuntu@ec2-54-228-60-184.eu-west-1.compute.amazonaws.com:/scepter/erw_spatial_mrv/data/outputs/yr_1/ \
+  erw_spatial_mrv/data/outputs/yr_1/
+```
+
+Replace `yr_1` with `yr_5`, `yr_10`, or the label you used. Then open the copied notebooks locally from:
+
+```text
+erw_spatial_mrv/data/outputs/yr_1/executed_notebooks/
 ```
 
 ### Monitor Progress
@@ -343,49 +425,46 @@ If it is not listed, inspect exited containers and logs:
 
 ```bash
 docker ps -a | grep erw
-docker logs erw-scepter-10yr
+docker logs erw-scepter-1yr
 ```
 
 Follow logs:
 
 ```bash
-docker logs -f erw-scepter-10yr
+docker logs -f erw-scepter-1yr
 ```
 
 Count completed SCEPTER summaries:
 
 ```bash
-find /scepter/erw_spatial_mrv/data/scepter_runs/outputs \
+find /scepter/erw_spatial_mrv/data/scepter_runs/outputs/yr_1 \
   -mindepth 2 -maxdepth 2 \
   -name '*_summary.csv' | wc -l
 ```
 
-The full current workflow target is:
-
-```text
-400 summary CSVs
-```
+Compare that count to `wc -l data/scepter_runs/inputs/scepter_runs.csv` minus one header row.
 
 Check disk use:
 
 ```bash
 df -h /scepter
-du -sh /scepter/erw_spatial_mrv/data/scepter_runs/outputs
+du -sh /scepter/erw_spatial_mrv/data/scepter_runs/outputs/yr_1
 ```
 
 Stop or resume:
 
 ```bash
-docker stop erw-scepter-10yr
-docker start erw-scepter-10yr
-docker logs -f erw-scepter-10yr
+docker stop erw-scepter-1yr
+docker start erw-scepter-1yr
+docker logs -f erw-scepter-1yr
 ```
 
-To rerun from a clean state:
+To rerun one label from a clean state:
 
 ```bash
-docker rm -f erw-scepter-10yr
-rm -rf /scepter/erw_spatial_mrv/data/scepter_runs/outputs/*
+docker rm -f erw-scepter-1yr
+rm -rf /scepter/erw_spatial_mrv/data/scepter_runs/outputs/yr_1
+rm -rf /scepter/erw_spatial_mrv/data/outputs/yr_1
 ```
 
 ## Troubleshooting
